@@ -1,0 +1,250 @@
+#! /bin/sh
+
+err_str1=“eth0无法连接到外网，请检查网络设置或DNS设置”
+
+slb_str1="请输入您需要添加到负载均衡器的服务器内部IP地址: "
+slb_str2="请输入您需要添加到负载均衡器的服务器数量: "
+slb_str3="请输入服务器的具体数量并回车"
+slb_str4="注意:请确认您现在操作的服务器将安装负载均衡，如需退出请按 ctrl + c 键.\n请按照向导操作设置"
+slb_str5="您输入的IP地址有误，请重新输入，IP地址格式为w.x.y.z，并且全为数字,eg 1.2.3.4"
+slb_str6="eth1无法连接到您设置的服务器IP地址,请重新输入"
+slb_str7="请稍后,正在为您设置..."
+slb_str8="请输入您需要添加到负载均衡器的下一个服务器内部IP地址:"
+slb_str9="负荷均衡器已经设置完毕,并复制此信息依次到您增加的服务器池中的linux服务器上执行\nwindows需要您做一些特别的其他设置，建议您参见使用指南"
+slb_str10="正在检测连通性..."
+slb_str11="负载均衡器的内部IP地址:"
+slb_str12="请输入您需要添加或删除负载均衡器的服务器数量: "
+slb_str13="您现在正在设置双机热备容错,请输入负载均衡对外服务的IP地址: "
+slb_str14=""
+slb_str15=""
+
+slb_cnf="/etc/keepalived/keepalived.conf"
+
+
+
+#软件配置
+function slb_cfg()  {
+   #设置好相应服务端口后，设置iptables
+   
+   [ -f "$slb_cnf" ] && mv $slb_cnf $slb_cnf.old
+   if [ -z $vport ]; then vport=80;fi
+   echo -e "
+     ! Configuration File for keepalived
+
+     global_defs {
+       router_id LVS_DEVEL
+     }
+
+     vrrp_sync_group VG_1 {
+        group {
+          VI_1
+        }
+     }
+     vrrp_instance VI_1 {
+  
+       interface eth0
+       virtual_router_id 51
+ 
+       advert_int 1
+       authentication {
+          auth_type PASS
+          auth_pass 1111
+      }">$slb_cnf
+if [ $isban -eq 1 ]; then
+      [ $ismaster -eq 1 ] &&echo "state MASTER">>$slb_cnf || echo "state BACKUP">>$slb_cnf
+      [ $ismaster -eq 1 ] &&echo "priority 200">>$slb_cnf || echo "priority 100">>$slb_cnf
+      echo -e "virtual_ipaddress {\n$vip\n}">>$slb_cnf
+fi
+echo "} ">>$slb_cnf
+echo -e "virtual_server $vip $vport {\n\tdelay_loop 6\n\tlb_algo dh\n\tlb_kind NAT\n\tnat_mask 255.255.255.0\n\tpersistence_timeout 50\n\tprotocol TCP\n\n">>$slb_cnf
+for((i=1;i<=${#rs_serlst[@]};i++)); do 
+  if [ ! -z ${rs_serlst[$i]} ]; then
+    echo -e "real_server ${rs_serlst[$i]} $vport {\n\tweight 1\n\tTCP_CHECK {\n\tconnect_timeout 3\n\t}\n}">>$slb_cnf
+    [ $i -eq $((${#rs_serlst[@]})) ] && echo "}">>$slb_cnf
+    `which iptables` -F
+    `which iptables` -I INPUT -s ${rs_serlst[i]} -p tcp -j ACCEPT
+  fi
+done
+
+service keepalived restart>/dev/null 2>&1
+}
+
+
+#软件安装
+function slb_inst() {
+   echo $slb_str7
+   echo y|yum install --nogpgcheck keepalived.`uname -m`>/dev/null 2>&1
+   echo y|yum install --nogpgcheck ipvsadm.`uname -m`>/dev/null 2>&1
+   modprobe ip_vs
+}
+
+
+#用户输入
+function user_puts() {
+   if [ $isSLB -eq 0 ]; then
+    [ -z $rs_num ] && read -p $slb_str2 rs_num
+   else
+     [ -z $rs_num ] && read -p $slb_str12 rs_num
+   fi
+    [ -z "$rs_num" ] && echo $slb_str3 && rs_num="" && user_puts
+    [ ! -z ${rs_num//[0-9]} ] && echo $slb_str3 && rs_num="" && user_puts    
+    if [ ! -z $1 ]; then
+        if [ $1 -gt 0 ]; then 
+	        read -p $slb_str8 rs_serlst[$1]
+	else 
+	        read -p $slb_str1 rs_serlst[$1]
+	fi
+        slb_tmpip=${rs_serlst[$1]}
+        if [ ! -z $slb_tmpip ] && [ ! -z $(echo ${slb_tmpip//[0-9]}|grep "^...$") ]; then 
+	    echo $slb_str10 && ping -I $lanip -c 1 $slb_tmpip >/dev/null 2>&1; [ "$?" -ne 0 ] && echo $slb_str6  && user_puts $1
+        else
+	    echo $slb_str5; user_puts $1
+	fi
+    fi
+}
+
+
+#初始化参数
+function slb_init() {
+   [ $isSLB -eq 0 ] && echo -e $slb_str4
+   user_puts
+   for((i=1;i<=$rs_num;i++)); do [ -z ${rs_serlst[i]} ] && user_puts $i; done
+}
+
+
+function slb_mt() {
+   #linux需要设置策略路由
+   echo -e $slb_str9
+   echo -e 　"\necho 100 SLB>>/etc/iproute2/rt_tables\nip rule add from $lanip table SLB\nip route add 0.0.0.0/0 dev eth1 table SLB"
+  
+   #windows需要设置内网IP为网关
+   echo -e "\n"$slb_str11$lanip
+}
+
+function slb_info(){
+    #输入:无
+    #输出:服务器状态
+    #状态实例
+
+    #负载均衡VIP:x.x.x.x       当前状态:运行中/停止/异常(待定)
+
+    #服务器列表(内部IP地址):	
+    #1.1.1.1                    运行中
+    #2.2.2.2                    运行中
+
+    #3.3.3.3                    异常
+
+    #按m添加或删除服务器,按q退出
+    bad=0
+    echo -e "负载均衡VIP: $vip\n"
+    echo -e "服务器列表(内部IP地址):\t\t当前状态\n"
+    tmp_hex=`cat /proc/net/ip_vs|grep "\->"|grep -v "Port"|awk '{print $2}'`
+    
+    for((i=1;i<=$pool_num;i++));do 
+      for((j=1;j<=$pool_num;j++)); do
+          if [ ! -z ${pool_hex[$j]} ]; then
+	      chk_num=$(echo  $(echo $tmp_hex $(((($i)*2)-1))|awk -F'[ :]+' '{print $($NF)}') ${pool_hex[$j]} $j|awk 'BEGIN{IGNORECASE=1}{if($1==$2){print $3}}')
+             [ ! -z $chk_num ] && pool_hex[$j]="" && break
+	     
+          fi
+	  
+      done
+    echo -e "${pool_ip[$chk_num]}\t\t\t`[ ! -z $chk_num ] &&echo '运行中'`"
+    
+    done
+    for((i=1;i<=$pool_num;i++));do [ ! -z ${pool_hex[$i]} ] && echo -e "${pool_ip[$i]}\t\t\t异常\n";done
+    read -p "按m添加或删除服务器,按q退出:" cho
+    case $cho in
+       q)
+         exit
+	 ;;
+       m)
+         slb_init
+	 ;;
+    esac
+}
+
+
+function newpool(){
+  #初始:pool_ip不为空,rs_serlst不为空
+  #输出:新的IP池 rs_serlst
+  tmp_count=${#rs_serlst[*]}
+  for((i=1;i<=$tmp_count;i++)) ;do 
+    if [ ! -z ${rs_serlst[$i]} ]; then
+    
+      for((k=1;k<=$pool_num;k++)); do 
+             if [ ! -z ${pool_ip[$k]} ]; then
+	        if [ "${rs_serlst[$i]}" != "${pool_ip[$k]}" ]; then 
+		       if [ $i == $tmp_count ]; then rs_serlst[$(($tmp_count+$k))]=${pool_ip[$k]} ;fi
+                else
+	                rs_serlst[$i]=""
+                        pool_ip[$k]=""
+			break
+                fi
+             fi
+      done
+    fi
+  done  
+}
+
+
+function iptohex(){
+  #初始:判断pool_ip是否是合法IP
+  #输出:十六进制IP值
+  tmp_ip=$1
+  tmp_hex=""
+  if [ ! -z ${tmp_ip//[0-9]} ] && [ ! -z $(echo ${tmp_ip//[0-9]}|grep "^...$") ]; then
+     for ((j=1;j<=4;j++)); do  tmp_hex=$tmp_hex`printf %x $(echo $tmp_ip|cut -d"." -f$j)`; done
+     pool_hex[$2]=$tmp_hex
+  fi
+}
+
+
+function run(){
+   #是否需要设置主副备
+   
+   if [ ! -z "$1" ] && [ "$1" == "-m" ]; then
+        isban=1
+        [ 1 == "$2" ] && ismaster=1 || ismaster=0 
+	read -p $slb_str13 vip       
+   fi
+   #检查系统是否已经设置了SLB
+   if [ $(ps -eLo args|grep "keepalived -D"|wc -l) -gt 1 ] && [ -f $slb_cnf ]; then
+        isSLB=1
+     #全局 取数字，构造IP池,转换十六进制
+     #1 添加   一台或多台   构造新IP池，写配置文件，复位服务
+     #2 删除   一台或多台   构造新IP池，写配置文件，复位服务
+     #3 状态   取本机IP,取IP池,取内核文件,检查服务器状态,输出SLB所有信息
+     pool_num=$(awk '/real/ {print $2}' $slb_cnf|wc -l)
+     pool_tmpstr=`awk '/real/ {print $2}' $slb_cnf`
+     for((i=1;i<=$pool_num;i++));do pool_ip[$i]=$(echo $pool_tmpstr|cut -d" " -f$i);done
+     for((i=1;i<=$pool_num;i++));do iptohex ${pool_ip[$i]} $i ;done
+     
+   fi
+     [ $isSLB -eq 1 ] && slb_info
+     slb_init
+     [ $isSLB -eq 0 ] && slb_inst
+     [ $isSLB -eq 1 ] && newpool
+     slb_cfg
+     slb_mt
+     #[ $isban -eq 1 ] && slb_ban
+  
+}
+
+#双机热备
+isban=0
+#是否已经设置
+isSLB=0
+#是否主机(1为主机,0为辅机)
+ismaster=0
+
+
+vip=""
+vport=""
+slb_tmpip=""
+
+lanip=$(ip addr|grep "eth1:" -C 2|awk '/inet / {print $2}'|cut -d"/" -f1)
+vip=$(ip addr|grep "eth0:" -C 2|awk '/inet / {print $2}')
+vip=${vip:0:(${#vip}-3)}
+ping -I $vip -c 1 www.qq.com>/dev/null 2>&1; [ "$?" -ne 0 ] && echo $srr_str1 && exit
+run $1 $2
